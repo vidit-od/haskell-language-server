@@ -39,6 +39,8 @@ data Log
     | LogNoteReferencesFound NormalizedFilePath [(Text, [Position])]
     deriving Show
 
+-- my local commit 
+
 data GetNotesInFile = MkGetNotesInFile
     deriving (Show, Generic, Eq, Ord)
     deriving anyclass (Hashable, NFData)
