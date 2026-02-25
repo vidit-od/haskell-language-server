@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 module Development.IDE.Plugin.Plugins.FillHole
   ( suggestFillHole
   ) where
@@ -8,17 +9,16 @@ import           Data.Char
 import qualified Data.HashSet                              as Set
 import qualified Data.Text                                 as T
 import           Development.IDE                           (FileDiagnostic,
+                                                            _message,
                                                             fdLspDiagnosticL,
                                                             printOutputable)
-import           Development.IDE.GHC.Compat                (ParsedModule, SDoc,
-                                                            defaultSDocContext,
+import           Development.IDE.GHC.Compat                (ParsedModule,
                                                             hsmodImports,
                                                             ideclAs, ideclName,
                                                             ideclQualified,
                                                             lookupOccEnv,
                                                             moduleNameString,
                                                             pm_parsed_source,
-                                                            renderWithContext,
                                                             unLoc)
 import           Development.IDE.GHC.Compat.Error          (TcRnMessageDetailed (TcRnMessageDetailed),
                                                             _TcRnMessageWithCtx,
@@ -32,7 +32,6 @@ import           Development.IDE.Types.Exports             (ExportsMap (..),
                                                             mkVarOrDataOcc,
                                                             moduleNameText)
 import           GHC.Tc.Errors.Types                       (ErrInfo (ErrInfo))
-import           Ide.PluginUtils                           (unescape)
 import           Language.Haskell.Syntax.ImpExp            (ImportDeclQualifiedStyle (..))
 import           Language.LSP.Protocol.Lens                (HasRange (..))
 import           Language.LSP.Protocol.Types               (TextEdit (TextEdit))
@@ -42,11 +41,20 @@ import           Text.Regex.TDFA                           (MatchResult (..),
 suggestFillHole :: ExportsMap -> ParsedModule -> FileDiagnostic -> [(T.Text, TextEdit)]
 suggestFillHole exportsMap pm diag
     | Just holeName <- extractHoleName diag
+#if MIN_VERSION_ghc(9,13,0)
+    , Just _errInfo <- extractErrInfo diag
+    , let supplText = _message (diag ^. fdLspDiagnosticL)
+    , let ctxText = supplText
+#else
     , Just (ErrInfo ctx suppl) <- extractErrInfo diag
-    , (holeFits, refFits) <- processHoleSuggestions $ T.lines (printErr suppl) =
-      let isInfixHole = printErr ctx =~ addBackticks holeName :: Bool in
+    , let ctxText = printOutputable ctx
+    , let supplText = printOutputable suppl
+#endif
+    , let (holeFits, refFits) = processHoleSuggestions (T.lines supplText)
+    , let isInfixHole = ctxText =~ addBackticks holeName :: Bool =
         map (proposeHoleFit holeName False isInfixHole) holeFits
-        ++ map (proposeHoleFit holeName True isInfixHole) refFits
+        ++
+        map (proposeHoleFit holeName True isInfixHole) refFits
     | otherwise = []
     where
       qualify = qualifyFit exportsMap pm
@@ -65,9 +73,6 @@ suggestFillHole exportsMap pm diag
                  . _TcRnMessageWithCtx
                  . _TcRnMessageWithInfo
           Just errInfo
-
-      printErr :: SDoc -> T.Text
-      printErr = unescape . T.pack . renderWithContext defaultSDocContext
 
       addBackticks :: T.Text -> T.Text
       addBackticks text = "`" <> text <> "`"

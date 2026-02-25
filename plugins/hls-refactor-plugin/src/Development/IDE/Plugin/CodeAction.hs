@@ -53,10 +53,7 @@ import           Development.IDE.GHC.Compat                        hiding
 import           Development.IDE.GHC.Compat.Error                  (TcRnMessage (..),
                                                                     _TcRnMessage,
                                                                     msgEnvelopeErrorL)
-import           GHC.Tc.Errors.Types                               (ShadowedNameProvenance (..),
-                                                                    UnusedImportName (..),
-                                                                    UnusedImportReason (..),
-                                                                    UnusedNameProv (..))
+import           GHC.Tc.Errors.Types                               (ShadowedNameProvenance (..))
 #if !MIN_VERSION_ghc(9,11,0)
 import           Development.IDE.GHC.Compat.Util
 #endif
@@ -136,7 +133,11 @@ import           GHC                                               (AnnsModule (
                                                                     EpaLocation' (..),
                                                                     HasLoc (..))
 #endif
-
+#if MIN_VERSION_ghc(9,7,0)
+import           GHC.Tc.Errors.Types                               (UnusedImportName (..),
+                                                                    UnusedImportReason (..),
+                                                                    UnusedNameProv (..))
+#endif
 
 -------------------------------------------------------------------------------------------------
 
@@ -393,10 +394,16 @@ suggestHideShadow ps fileContents mTcM mHar fd =
 
                 greModsAndSpans :: GlobalRdrElt -> [(T.Text, RealSrcSpan)]
                 greModsAndSpans gre =
-                  [ (T.pack $ moduleNameString $ moduleName $ is_mod (is_decl imp), sp)
-                  | imp <- gre_imp gre
-                  , RealSrcSpan sp _ <- [is_dloc (is_decl imp)]
-                  ]
+                    [ (T.pack $ moduleNameString modName, sp)
+                    | imp <- gre_imp gre
+                    , let modName =
+#if MIN_VERSION_ghc(9,7,0)
+                            moduleName $ is_mod (is_decl imp)
+#else
+                            is_mod (is_decl imp)
+#endif
+                    , RealSrcSpan sp _ <- [is_dloc (is_decl imp)]
+                    ]
 
                 suggests :: T.Text -> RealSrcSpan -> [(T.Text, [Either TextEdit Rewrite])]
                 suggests modName s'
@@ -462,8 +469,47 @@ isUnusedImportedId
       maybe True (not . any (\(_, IdentifierDetails {..}) -> identInfo == S.singleton Use)) refs
     | otherwise = False
 
-suggestRemoveRedundantImport :: ParsedModule -> Maybe T.Text -> FileDiagnostic -> [(T.Text, [TextEdit])]
-suggestRemoveRedundantImport ParsedModule{pm_parsed_source = L _ HsModule{hsmodImports}} contents fd =
+suggestRemoveRedundantImportBinding :: ParsedModule -> Maybe T.Text -> FileDiagnostic -> [(T.Text, [TextEdit])]
+suggestRemoveRedundantImportBinding pm contents fd =
+#if MIN_VERSION_ghc(9,7,0)
+    suggestRemoveRedundantImportStructured pm contents fd
+#else
+    suggestRemoveRedundantImportRegex pm contents (fdLspDiagnostic fd)
+#endif
+
+#if !MIN_VERSION_ghc(9,7,0)
+suggestRemoveRedundantImportRegex :: ParsedModule -> Maybe T.Text -> Diagnostic -> [(T.Text, [TextEdit])]
+suggestRemoveRedundantImportRegex ParsedModule{pm_parsed_source = L _  HsModule{hsmodImports}} contents Diagnostic{_range=_range,..}
+--     The qualified import of ‘many’ from module ‘Control.Applicative’ is redundant
+    | Just [_, bindings] <- matchRegexUnifySpaces _message "The( qualified)? import of ‘([^’]*)’ from module [^ ]* is redundant"
+    , Just (L _ impDecl) <- find (\(L (locA -> l) _) -> _start _range `isInsideSrcSpan` l && _end _range `isInsideSrcSpan` l ) hsmodImports
+    , Just c <- contents
+    , ranges <- map (rangesForBindingImport impDecl . T.unpack) (T.splitOn ", " bindings >>= trySplitIntoOriginalAndRecordField)
+    , ranges' <- extendAllToIncludeCommaIfPossible False (indexedByPosition $ T.unpack c) (concat ranges)
+    , not (null ranges')
+    = [( "Remove " <> bindings <> " from import" , [ TextEdit r "" | r <- ranges' ] )]
+
+-- File.hs:16:1: warning:
+--     The import of `Data.List' is redundant
+--       except perhaps to import instances from `Data.List'
+--     To import instances alone, use: import Data.List()
+    | _message =~ ("The( qualified)? import of [^ ]* is redundant" :: String)
+        = [("Remove import", [TextEdit (extendToWholeLineIfPossible contents _range) ""])]
+    | otherwise = []
+    where
+      -- In case of an unused record field import, the binding from the message will not match any import directly
+      -- In this case, we try if we can additionally extract a record field name
+      -- Example: The import of ‘B(b2)’ from module ‘ModuleB’ is redundant
+      trySplitIntoOriginalAndRecordField :: T.Text -> [T.Text]
+      trySplitIntoOriginalAndRecordField binding =
+        case matchRegexUnifySpaces binding "([^ ]+)\\(([^)]+)\\)" of
+          Just [_, fields] -> [binding, fields]
+          _                -> [binding]
+#endif
+
+#if MIN_VERSION_ghc(9,7,0)
+suggestRemoveRedundantImportStructured  :: ParsedModule -> Maybe T.Text -> FileDiagnostic -> [(T.Text, [TextEdit])]
+suggestRemoveRedundantImportStructured  ParsedModule{pm_parsed_source = L _ HsModule{hsmodImports}} contents fd =
     case fd ^? fdStructuredMessageL . _SomeStructuredMessage . msgEnvelopeErrorL . _TcRnMessage of
         Just (TcRnUnusedImport impDecl reason) ->
             let wantedModule = moduleNameString $ unLoc $ ideclName impDecl
@@ -502,6 +548,7 @@ unusedImportNameText (UnusedImportNameRecField parent occName) =
     case parent of
         ParentIs name -> T.pack (getOccString name) <> "(" <> T.pack (occNameString occName) <> ")"
         NoParent -> T.pack (occNameString occName)  -- Fallback safety (unlikely)
+#endif
 
 diagInRange :: Diagnostic -> Range -> Bool
 diagInRange Diagnostic {_range = dr} r = dr `subRange` extendedRange
@@ -519,7 +566,7 @@ diagInRange Diagnostic {_range = dr} r = dr `subRange` extendedRange
 caRemoveRedundantImports :: Maybe ParsedModule -> Maybe T.Text -> [FileDiagnostic] -> Range -> Uri -> [Command |? CodeAction]
 caRemoveRedundantImports m contents allDiags contextRange uri
   | Just pm <- m,
-    r <- join $ map (\fd -> let d = fdLspDiagnostic fd in repeat d `zip` suggestRemoveRedundantImport pm contents fd) allDiags,
+    r <- join $ map (\fd -> let d = fdLspDiagnostic fd in repeat d `zip` suggestRemoveRedundantImportBinding pm contents fd) allDiags,
     allEdits <- [ e | (_, (_, edits)) <- r, e <- edits],
     caRemoveAll <- removeAll allEdits,
     ctxEdits <- [ x | x@(d, _) <- r, d `diagInRange` contextRange],
@@ -621,16 +668,32 @@ suggestRemoveRedundantExport _ _ = Nothing
 
 suggestDeleteUnusedBinding :: ParsedModule -> Maybe T.Text -> FileDiagnostic -> [(T.Text, [TextEdit])]
 suggestDeleteUnusedBinding pm contents fd =
-    case fd ^? fdStructuredMessageL . _SomeStructuredMessage . msgEnvelopeErrorL . _TcRnMessage of
-        Just (TcRnUnusedName occName prov)
-            | isLocalUnusedName prov -> suggestDeleteUnusedBindingByName pm contents (T.pack $ occNameString occName) (fdLspDiagnostic fd)
-        _ -> []
+#if MIN_VERSION_ghc(9,7,0)
+    suggestDeleteUnusedBindingStructured pm contents fd
+#else
+    suggestDeleteUnusedBindingRegex pm contents (fdLspDiagnostic fd)
+#endif
+
+#if MIN_VERSION_ghc(9,7,0)
+suggestDeleteUnusedBindingStructured :: ParsedModule -> Maybe T.Text -> FileDiagnostic -> [(T.Text, [TextEdit])]
+suggestDeleteUnusedBindingStructured pm contents fd
+    | Just (TcRnUnusedName occName prov) <- fd ^? fdStructuredMessageL . _SomeStructuredMessage . msgEnvelopeErrorL . _TcRnMessage
+    , isLocalUnusedName prov
+    = suggestDeleteUnusedBindingByName pm contents (T.pack $ occNameString occName) (fdLspDiagnostic fd)
+    | otherwise = []
 
 isLocalUnusedName :: UnusedNameProv -> Bool
 isLocalUnusedName UnusedNameTopDecl   = True
 isLocalUnusedName UnusedNameLocalBind = True
 isLocalUnusedName UnusedNameMatch     = True
 isLocalUnusedName _                   = False
+#else
+suggestDeleteUnusedBindingRegex :: ParsedModule -> Maybe T.Text -> Diagnostic -> [(T.Text, [TextEdit])]
+suggestDeleteUnusedBindingRegex pm contents diag@Diagnostic{_message}
+    | Just [name] <- matchRegexUnifySpaces _message ".*Defined but not used: ‘([^ ]+)’"
+    = suggestDeleteUnusedBindingByName pm contents name diag
+    | otherwise = []
+#endif
 
 suggestDeleteUnusedBindingByName :: ParsedModule -> Maybe T.Text -> T.Text -> Diagnostic -> [(T.Text, [TextEdit])]
 suggestDeleteUnusedBindingByName ParsedModule{pm_parsed_source = L _ HsModule{hsmodDecls}} contents name Diagnostic{_range=_range}
@@ -754,13 +817,25 @@ getLocatedRange = srcSpanToRange . getLoc
 
 suggestExportUnusedTopBinding :: Maybe T.Text -> ParsedModule -> FileDiagnostic -> Maybe (T.Text, TextEdit)
 suggestExportUnusedTopBinding srcOpt pm fd =
--- Foo.hs:4:1: warning: [-Wunused-top-binds] Defined but not used: ‘f’
--- Foo.hs:5:1: warning: [-Wunused-top-binds] Defined but not used: type constructor or class ‘F’
--- Foo.hs:6:1: warning: [-Wunused-top-binds] Defined but not used: data constructor ‘Bar’
-    case fd ^? fdStructuredMessageL . _SomeStructuredMessage . msgEnvelopeErrorL . _TcRnMessage of
-        Just (TcRnUnusedName occName UnusedNameTopDecl) ->
-            suggestExportUnusedTopBindingByName srcOpt pm (T.pack $ occNameString occName) (fdLspDiagnostic fd)
-        _ -> Nothing
+#if MIN_VERSION_ghc(9,7,0)
+    suggestExportUnusedTopBindingStructured srcOpt pm fd
+#else
+    suggestExportUnusedTopBindingRegex srcOpt pm (fdLspDiagnostic fd)
+#endif
+
+#if MIN_VERSION_ghc(9,7,0)
+suggestExportUnusedTopBindingStructured :: Maybe T.Text -> ParsedModule -> FileDiagnostic -> Maybe (T.Text, TextEdit)
+suggestExportUnusedTopBindingStructured srcOpt pm fd
+    | Just (TcRnUnusedName occName UnusedNameTopDecl) <- fd ^? fdStructuredMessageL . _SomeStructuredMessage . msgEnvelopeErrorL . _TcRnMessage
+    = suggestExportUnusedTopBindingByName srcOpt pm (T.pack $ occNameString occName) (fdLspDiagnostic fd)
+    | otherwise = Nothing
+#else
+suggestExportUnusedTopBindingRegex :: Maybe T.Text -> ParsedModule -> Diagnostic -> Maybe (T.Text, TextEdit)
+suggestExportUnusedTopBindingRegex srcOpt pm diag@Diagnostic{_message}
+    | Just [_, name] <- matchRegexUnifySpaces _message  ".*Defined but not used: (type constructor or class |data constructor )?‘([^ ]+)’"
+    = suggestExportUnusedTopBindingByName srcOpt pm name diag
+    | otherwise = Nothing
+#endif
 
 suggestExportUnusedTopBindingByName :: Maybe T.Text -> ParsedModule -> T.Text -> Diagnostic -> Maybe (T.Text, TextEdit)
 suggestExportUnusedTopBindingByName srcOpt ParsedModule{pm_parsed_source = L _ HsModule{..}} name Diagnostic{..}

@@ -12,6 +12,7 @@ import           Development.IDE.GHC.ExactPrint            (modifyMgMatchesT',
                                                             modifySigWithM,
                                                             modifySmallestDeclWithM)
 import           Development.IDE.Plugin.Plugins.Diagnostic
+import           Development.IDE.Types.Diagnostics         (FileDiagnostic (fdLspDiagnostic))
 import           GHC.Parser.Annotation                     (SrcSpanAnnA,
                                                             SrcSpanAnnN, noAnn)
 import           Ide.Plugin.Error                          (PluginError (PluginInternalError))
@@ -32,7 +33,6 @@ import           GHC.Parser.Annotation                     (TokenLocation (..))
 #if !MIN_VERSION_ghc(9,9,0)
 import           Development.IDE.GHC.Compat.ExactPrint     (makeDeltaAst)
 import           Development.IDE.GHC.ExactPrint            (genAnchor1)
-import           Development.IDE.Types.Diagnostics         (FileDiagnostic (fdLspDiagnostic))
 import           GHC.Parser.Annotation                     (EpAnn (..),
                                                             SrcSpanAnn' (..),
                                                             emptyComments)
