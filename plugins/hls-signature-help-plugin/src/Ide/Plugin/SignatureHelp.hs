@@ -4,6 +4,7 @@
 
 module Ide.Plugin.SignatureHelp (descriptor) where
 
+import           Control.Applicative
 import           Control.Arrow                        ((>>>))
 import           Control.Monad.Trans.Except           (ExceptT (ExceptT))
 import           Data.Bifunctor                       (bimap)
@@ -49,6 +50,7 @@ import           GHC.Iface.Ext.Types                  (ContextInfo (Use),
                                                        HieAST (nodeChildren, nodeSpan),
                                                        HieASTs (getAsts),
                                                        IdentifierDetails (identInfo, identType),
+                                                       NodeInfo (nodeIdentifiers),
                                                        nodeType)
 import           GHC.Iface.Ext.Utils                  (smallestContainingSatisfying)
 import           GHC.Types.Name.Env                   (lookupNameEnv)
@@ -295,7 +297,10 @@ getNodeNameAndTypes hieKind hieAst =
         case extractName identifier of
           Nothing -> Nothing
           Just name ->
-            let mTypeOfName = identType identifierDetails
+            let mTypeOfName = identType identifierDetails <|> do
+                                nodeInfo <- generatedNodeInfo hieAst
+                                details <- M.lookup identifier (nodeIdentifiers nodeInfo)
+                                identType details
                 -- types from the source NodeInfo
                 typesOfNode = case sourceNodeInfo hieAst of
                   Nothing       -> []
